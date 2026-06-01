@@ -184,18 +184,55 @@ func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *Rende
 	actType, actTitle := classifyProcessDelta(text)
 	actions := handle.state.Actions
 
-	// Tool calls always create separate actions — never consolidate.
+	// Tool calls: "Starting/Calling/..." starts a new action; everything else updates the last tool action.
 	if actType == ActionTool {
+		if actTitle != "" {
+			// New tool call beginning (has a title extracted from prefix)
+			act := Action{
+				ID:     fmt.Sprintf("panel_%d", len(actions)),
+				Seq:    len(actions),
+				Type:   actType,
+				Title:  actTitle,
+				State:  ActRunning,
+				Detail: formatProcessDetail(text),
+			}
+			handle.state.Actions = append(handle.state.Actions, act)
+			seq := handle.sequence
+			handle.sequence++
+			if err := r.withRetry(ctx, handle.ChatID, func() error {
+				return r.gw.InsertStreamingElementsBefore(ctx, handle.CardID, finalAnswerElementID, []map[string]any{buildPanelForInsert(act)}, seq)
+			}); err != nil {
+				return err
+			}
+			handle.lastSent[act.ID+"_content"] = act.Detail
+			handle.updates++
+			handle.lastFlush = r.now()
+			if len(handle.state.Actions) > maxActions {
+				handle.state.Actions = compactActions(handle.state.Actions)
+			}
+			return nil
+		}
+
+		// Tool continuation (output, completed, failed) — update the last tool action.
+		if len(actions) > 0 && actions[len(actions)-1].Type == ActionTool {
+			last := &actions[len(actions)-1]
+			last.Detail = strings.TrimSpace(last.Detail + "\n" + formatProcessDetail(text))
+			if strings.Contains(strings.ToLower(text), "failed") || strings.Contains(strings.ToLower(text), "error") {
+				last.State = ActFailed
+			}
+			return r.syncActionContentLocked(ctx, handle, last)
+		}
+
+		// No previous tool action — create one with fallback title.
 		act := Action{
 			ID:     fmt.Sprintf("panel_%d", len(actions)),
 			Seq:    len(actions),
 			Type:   actType,
-			Title:  actTitle,
+			Title:  "Tool",
 			State:  ActRunning,
 			Detail: formatProcessDetail(text),
 		}
 		handle.state.Actions = append(handle.state.Actions, act)
-
 		seq := handle.sequence
 		handle.sequence++
 		if err := r.withRetry(ctx, handle.ChatID, func() error {
@@ -206,9 +243,6 @@ func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *Rende
 		handle.lastSent[act.ID+"_content"] = act.Detail
 		handle.updates++
 		handle.lastFlush = r.now()
-		if len(handle.state.Actions) > maxActions {
-			handle.state.Actions = compactActions(handle.state.Actions)
-		}
 		return nil
 	}
 
@@ -413,7 +447,7 @@ func isProcessContinuation(text string) bool {
 	clean = strings.TrimPrefix(clean, "[Process] ")
 	clean = strings.TrimPrefix(clean, "[Process]")
 	_, _, hasOutput := cutProcessOutput(clean)
-	return hasOutput || strings.Contains(clean, "completed") || strings.Contains(clean, "✓")
+	return hasOutput || strings.Contains(clean, "completed") || strings.Contains(clean, "✓") || strings.Contains(clean, "failed")
 }
 
 func formatProcessDetail(text string) string {
