@@ -217,13 +217,16 @@ func validateNetworkAgent(id string, agent AgentConfig) error {
 	if err != nil {
 		return fmt.Errorf("network agent %q parse url failed, %w", id, err)
 	}
-	if u.Scheme != "wss" {
-		return fmt.Errorf("network agent %q url must use wss", id)
+	if u.Scheme != "wss" && u.Scheme != "ws" {
+		return fmt.Errorf("network agent %q url must use wss or ws", id)
+	}
+	if u.Scheme == "ws" && u.Hostname() != "127.0.0.1" && u.Hostname() != "localhost" {
+		return fmt.Errorf("network agent %q ws scheme only allowed for localhost", id)
 	}
 	if !contains(agent.EndpointAllowlist, agent.URL) {
 		return fmt.Errorf("network agent %q url must be in endpoint_allowlist", id)
 	}
-	if agent.TLS.InsecureSkipVerify {
+	if agent.TLS.InsecureSkipVerify && u.Scheme != "ws" {
 		return fmt.Errorf("network agent %q tls.insecure_skip_verify must be false", id)
 	}
 	if !agent.Request.RequireRequestID {
