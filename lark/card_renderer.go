@@ -105,7 +105,8 @@ func (r *CardRenderer) maybeFlushLocked(ctx context.Context, handle *RenderHandl
 	return r.flushLocked(ctx, handle, false)
 }
 
-// CardStreamingRenderer streams a structured card with foldable process blocks and a final answer area.
+// CardStreamingRenderer renders a structured streaming card with collapsible action panels
+// above a typewriter-animated final answer.
 type CardStreamingRenderer struct {
 	cfg     config.StreamingConfig
 	gw      Gateway
@@ -122,7 +123,7 @@ func (r *CardStreamingRenderer) Start(ctx context.Context, req StartRenderReques
 	var cardID string
 	if err := r.withRetry(ctx, req.ChatID, func() error {
 		var err error
-		cardID, err = r.gw.CreateStreamingCard(ctx, Card{Raw: buildStructuredStreamingCard(nil, false)})
+		cardID, err = r.gw.CreateStreamingCard(ctx, Card{Raw: buildInitialCard()})
 		return err
 	}); err != nil {
 		return nil, fmt.Errorf("card_streaming: create card failed, %w", err)
@@ -137,10 +138,18 @@ func (r *CardStreamingRenderer) Start(ctx context.Context, req StartRenderReques
 	}
 	r.gw.RememberSelfMessage(sent.MessageID)
 	r.filter.Remember(sent.MessageID)
+
+	state := &CardState{
+		Actions:     nil,
+		FinalAnswer: "",
+		Finished:    false,
+	}
 	return &RenderHandle{
 		MessageID: sent.MessageID,
 		ChatID:    req.ChatID,
 		CardID:    cardID,
+		state:     state,
+		lastSent:  map[string]string{},
 		sequence:  1,
 		startedAt: r.now(),
 		lastFlush: r.now(),
@@ -150,155 +159,158 @@ func (r *CardStreamingRenderer) Start(ctx context.Context, req StartRenderReques
 func (r *CardStreamingRenderer) Append(ctx context.Context, handle *RenderHandle, delta string) error {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
-	handle.answer += delta
-	handle.segment += delta
-	return r.maybeFlushFinalLocked(ctx, handle, delta)
+	handle.state.FinalAnswer += delta
+	return r.syncFinalAnswerLocked(ctx, handle)
 }
 
 func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *RenderHandle, delta string) error {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
-	if err := r.flushAnswerBlockLocked(ctx, handle); err != nil {
+
+	text := strings.TrimSpace(delta)
+	if text == "" {
+		return nil
+	}
+
+	// Determine action type from delta text
+	actType, actTitle := classifyProcessDelta(text)
+	actions := handle.state.Actions
+
+	// Check if this is a continuation of the last action
+	if len(actions) > 0 && actions[len(actions)-1].Type == actType &&
+		(actType == ActionTool || actType == ActionProcess) &&
+		isProcessContinuation(text) {
+		// Update last action detail
+		last := &actions[len(actions)-1]
+		last.Detail = strings.TrimSpace(last.Detail + "\n" + formatProcessDetail(text))
+		return r.syncActionContentLocked(ctx, handle, last)
+	}
+
+	// New action
+	act := Action{
+		ID:    fmt.Sprintf("panel_%d", len(actions)),
+		Seq:   len(actions),
+		Type:  actType,
+		Title: actTitle,
+		State: ActRunning,
+		Detail: formatProcessDetail(text),
+	}
+	handle.state.Actions = append(handle.state.Actions, act)
+
+	// Insert panel before answer_final
+	seq := handle.sequence
+	handle.sequence++
+	if err := r.withRetry(ctx, handle.ChatID, func() error {
+		return r.gw.InsertStreamingElementsBefore(ctx, handle.CardID, finalAnswerElementID, []map[string]any{buildPanelForInsert(act)}, seq)
+	}); err != nil {
 		return err
 	}
-	return r.appendToolBlockLocked(ctx, handle, delta)
+	handle.lastSent[act.ID+"_content"] = act.Detail
+	handle.updates++
+	handle.lastFlush = r.now()
+
+	// Compact if too many actions
+	if len(handle.state.Actions) > maxActions {
+		handle.state.Actions = compactActions(handle.state.Actions)
+	}
+	return nil
 }
 
 func (r *CardStreamingRenderer) Finish(ctx context.Context, handle *RenderHandle, final string) error {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
+
 	if final != "" {
-		handle.final = final
+		handle.state.FinalAnswer = final
 	}
-	if handle.final == "" && strings.TrimSpace(handle.answer) != "" {
-		handle.final = handle.answer
-	}
-	if err := r.flushFinalLocked(ctx, handle, true); err != nil {
+	// Ensure final answer is synced
+	if err := r.syncFinalAnswerLocked(ctx, handle); err != nil {
 		return err
 	}
-	patchErr := r.patchFinalCardLocked(ctx, handle, true)
-	finalizeErr := r.finalizeLocked(ctx, handle)
-	if patchErr != nil {
-		return patchErr
+
+	handle.state.Finished = true
+
+	// 1. Finalize streaming (streaming_mode: false)
+	if err := r.finalizeLocked(ctx, handle); err != nil {
+		return err
 	}
-	return finalizeErr
+
+	// 2. Send final static card with correct icons + collapsed panels
+	return r.patchFinalCardLocked(ctx, handle)
 }
 
 func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, err error) error {
 	if err == nil {
-		err = errors.New("unknown error")
+		err = fmt.Errorf("unknown error")
 	}
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
-	handle.failed = err.Error()
-	if err := r.flushAnswerBlockLocked(ctx, handle); err != nil {
+
+	// Add error action if there's a last running action
+	actions := handle.state.Actions
+	if len(actions) > 0 && actions[len(actions)-1].State == ActRunning {
+		actions[len(actions)-1].State = ActFailed
+		actions[len(actions)-1].Detail = strings.TrimSpace(actions[len(actions)-1].Detail + "\n\n❌ " + err.Error())
+	} else {
+		// Standalone error action
+		act := Action{
+			ID:     fmt.Sprintf("panel_%d", len(actions)),
+			Seq:    len(actions),
+			Type:   ActionProcess,
+			Title:  "Error",
+			State:  ActFailed,
+			Detail: err.Error(),
+		}
+		handle.state.Actions = append(handle.state.Actions, act)
+	}
+
+	handle.state.Finished = true
+
+	if err := r.finalizeLocked(ctx, handle); err != nil {
 		return err
 	}
-	if err := r.flushFailureBlockLocked(ctx, handle); err != nil {
-		return err
-	}
-	if err := r.flushFinalLocked(ctx, handle, true); err != nil {
-		return err
-	}
-	finalizeErr := r.finalizeLocked(ctx, handle)
-	patchErr := r.patchFinalCardLocked(ctx, handle, true)
-	if finalizeErr != nil {
-		return finalizeErr
-	}
-	return patchErr
+	return r.patchFinalCardLocked(ctx, handle)
 }
 
-func (r *CardStreamingRenderer) maybeFlushFinalLocked(ctx context.Context, handle *RenderHandle, delta string) error {
-	if handle.updates >= r.cfg.MaxUpdatesPerMessage {
-		return nil
-	}
-	if r.now().Sub(handle.lastFlush) < r.cfg.UpdateInterval.Duration {
-		return nil
-	}
-	return r.flushFinalLocked(ctx, handle, false)
-}
+// ─── Sync helpers ──────────────────────────────────────────────
 
-func (r *CardStreamingRenderer) flushAnswerBlockLocked(ctx context.Context, handle *RenderHandle) error {
-	content := strings.TrimSpace(handle.segment)
+func (r *CardStreamingRenderer) syncFinalAnswerLocked(ctx context.Context, handle *RenderHandle) error {
+	content := handle.state.FinalAnswer
 	if content == "" {
+		content = "_Waiting..._"
+	}
+	content = truncateRunes(content, r.cfg.MaxUpdateChars, "")
+	if content == handle.lastSent[finalAnswerElementID] {
 		return nil
 	}
-	handle.segment = ""
-	if err := r.insertBlockLocked(ctx, handle, cardBlockKindAnswer, summarizeAnswerTitle(content), content); err != nil {
-		return err
-	}
-	return r.flushFinalLocked(ctx, handle, false)
-}
-
-func (r *CardStreamingRenderer) appendToolBlockLocked(ctx context.Context, handle *RenderHandle, delta string) error {
-	text := strings.TrimSpace(delta)
-	if text == "" {
-		return nil
-	}
-	appendProcess(handle, text)
-	if isToolContinuation(text) && len(handle.blocks) > 0 && handle.blocks[len(handle.blocks)-1].Kind == cardBlockKindTool {
-		block := &handle.blocks[len(handle.blocks)-1]
-		block.Content = strings.TrimSpace(block.Content + "\n\n" + formatProcessMarkdown(text))
-		return r.updateStreamingElementLocked(ctx, handle, block.ElementID, block.Content, false)
-	}
-	return r.insertBlockLocked(ctx, handle, cardBlockKindTool, summarizeToolTitle(text), formatProcessMarkdown(text))
-}
-
-func (r *CardStreamingRenderer) flushFinalLocked(ctx context.Context, handle *RenderHandle, final bool) error {
-	content := renderFinalAnswer(handle, final)
-	if content == handle.finalView {
-		return nil
-	}
-	if err := r.updateStreamingElementLocked(ctx, handle, cardStreamingFinalElementID, content, final); err != nil {
-		return err
-	}
-	handle.finalView = content
-	return nil
-}
-
-func (r *CardStreamingRenderer) flushFailureBlockLocked(ctx context.Context, handle *RenderHandle) error {
-	if strings.TrimSpace(handle.failed) == "" {
-		return nil
-	}
-	content := codeFence(trimProcessOutput(handle.failed))
-	if len(handle.blocks) > 0 && handle.blocks[len(handle.blocks)-1].Kind == cardBlockKindTool {
-		block := &handle.blocks[len(handle.blocks)-1]
-		block.Content = strings.TrimSpace(block.Content + "\n\n" + content)
-		return r.updateStreamingElementLocked(ctx, handle, block.ElementID, block.Content, true)
-	}
-	return r.insertBlockLocked(ctx, handle, cardBlockKindTool, "Failed", content)
-}
-
-func (r *CardStreamingRenderer) insertBlockLocked(ctx context.Context, handle *RenderHandle, kind string, title string, content string) error {
-	handle.blockSeq++
-	elementID := fmt.Sprintf("history_%03d", handle.blockSeq)
-	block := cardBlock{Kind: kind, Title: title, Content: content, ElementID: elementID}
 	seq := handle.sequence
 	handle.sequence++
 	if err := r.withRetry(ctx, handle.ChatID, func() error {
-		return r.gw.InsertStreamingElementsBefore(ctx, handle.CardID, cardStreamingFinalElementID, []map[string]any{collapsibleBlockElement(block)}, seq)
+		return r.gw.UpdateStreamingElement(ctx, handle.CardID, finalAnswerElementID, content, seq)
 	}); err != nil {
 		return err
 	}
-	handle.blocks = append(handle.blocks, block)
+	handle.lastSent[finalAnswerElementID] = content
 	handle.updates++
 	handle.lastFlush = r.now()
 	return nil
 }
 
-func (r *CardStreamingRenderer) updateStreamingElementLocked(ctx context.Context, handle *RenderHandle, elementID, content string, final bool) error {
-	max := r.cfg.MaxUpdateChars
-	suffix := ""
-	if final {
-		max = r.cfg.MaxFinalChars
-		suffix = r.cfg.TruncateNotice
+func (r *CardStreamingRenderer) syncActionContentLocked(ctx context.Context, handle *RenderHandle, a *Action) error {
+	content := renderActionContent(*a)
+	content = truncateRunes(content, r.cfg.MaxUpdateChars, "")
+	elementID := a.ID + "_content"
+	if content == handle.lastSent[elementID] {
+		return nil
 	}
-	content = truncateRunes(content, max, suffix)
 	seq := handle.sequence
 	handle.sequence++
-	if err := r.withRetry(ctx, handle.ChatID, func() error { return r.gw.UpdateStreamingElement(ctx, handle.CardID, elementID, content, seq) }); err != nil {
+	if err := r.withRetry(ctx, handle.ChatID, func() error {
+		return r.gw.UpdateStreamingElement(ctx, handle.CardID, elementID, content, seq)
+	}); err != nil {
 		return err
 	}
+	handle.lastSent[elementID] = content
 	handle.updates++
 	handle.lastFlush = r.now()
 	return nil
@@ -307,20 +319,79 @@ func (r *CardStreamingRenderer) updateStreamingElementLocked(ctx context.Context
 func (r *CardStreamingRenderer) finalizeLocked(ctx context.Context, handle *RenderHandle) error {
 	seq := handle.sequence
 	handle.sequence++
-	return r.withRetry(ctx, handle.ChatID, func() error { return r.gw.FinalizeStreamingCard(ctx, handle.CardID, seq) })
+	return r.withRetry(ctx, handle.ChatID, func() error {
+		return r.gw.FinalizeStreamingCard(ctx, handle.CardID, seq)
+	})
 }
 
-func (r *CardStreamingRenderer) patchFinalCardLocked(ctx context.Context, handle *RenderHandle, final bool) error {
+func (r *CardStreamingRenderer) patchFinalCardLocked(ctx context.Context, handle *RenderHandle) error {
 	if handle.MessageID == "" {
 		return nil
 	}
+	card := Card{Raw: buildFinalCard(handle.state)}
 	return r.withRetry(ctx, handle.ChatID, func() error {
-		return r.gw.UpdateCard(ctx, handle.MessageID, Card{Raw: buildStreamingSnapshotCard(handle, final)})
+		return r.gw.UpdateCard(ctx, handle.MessageID, card)
 	})
 }
 
 func (r *CardStreamingRenderer) withRetry(ctx context.Context, chatID string, op func() error) error {
 	return withStreamingRetry(ctx, r.cfg, r.limiter, chatID, op)
+}
+
+// ─── Process delta classification ──────────────────────────────
+
+// classifyProcessDelta determines the action type and title from a process delta string.
+func classifyProcessDelta(text string) (ActionType, string) {
+	clean := strings.TrimSpace(text)
+	clean = strings.TrimPrefix(clean, "[Process] ")
+	clean = strings.TrimPrefix(clean, "[Process]")
+
+	// Tool call patterns
+	for _, prefix := range []string{"Starting ", "Calling ", "Running ", "Executing "} {
+		if strings.HasPrefix(clean, prefix) {
+			title := strings.TrimSpace(strings.TrimPrefix(clean, prefix))
+			if before, _, ok := cutProcessOutput(title); ok {
+				title = strings.TrimSpace(before)
+			}
+			return ActionTool, firstLineOrDefault(title, "Tool")
+		}
+	}
+	// Tool result pattern
+	if strings.HasPrefix(clean, "✓ ") || strings.HasPrefix(clean, "✅ ") ||
+		strings.Contains(clean, "completed") || strings.Contains(clean, "output:") {
+		return ActionTool, ""
+	}
+
+	// Thinking pattern
+	if strings.Contains(strings.ToLower(clean), "thinking") ||
+		strings.Contains(strings.ToLower(clean), "analyzing") ||
+		strings.Contains(strings.ToLower(clean), "reasoning") {
+		return ActionThinking, "Thinking"
+	}
+
+	return ActionProcess, firstLineOrDefault(clean, "Process")
+}
+
+func isProcessContinuation(text string) bool {
+	clean := strings.TrimSpace(text)
+	clean = strings.TrimPrefix(clean, "[Process] ")
+	clean = strings.TrimPrefix(clean, "[Process]")
+	_, _, hasOutput := cutProcessOutput(clean)
+	return hasOutput || strings.Contains(clean, "completed") || strings.Contains(clean, "✓")
+}
+
+func formatProcessDetail(text string) string {
+	clean := strings.TrimSpace(text)
+	clean = strings.TrimPrefix(clean, "[Process] ")
+	clean = strings.TrimPrefix(clean, "[Process]")
+	if before, after, ok := cutProcessOutput(clean); ok {
+		before = strings.TrimSpace(before)
+		if before != "" {
+			return fmt.Sprintf("**%s**\n%s", before, codeFence(trimProcessOutput(strings.TrimSpace(after))))
+		}
+		return codeFence(trimProcessOutput(strings.TrimSpace(after)))
+	}
+	return clean
 }
 
 func appendProcess(handle *RenderHandle, delta string) {

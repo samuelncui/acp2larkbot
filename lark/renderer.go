@@ -42,6 +42,10 @@ type RenderHandle struct {
 	startedAt time.Time
 	lastFlush time.Time
 	mu        sync.Mutex
+
+	// CardStreamingRenderer uses these fields instead of the generic ones above.
+	state    *CardState
+	lastSent map[string]string // elementID → content
 }
 
 type cardBlock struct {

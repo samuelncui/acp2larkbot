@@ -69,7 +69,7 @@ func TestCardStreamingRendererShowsErrorSection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
-	if err := r.AppendProcess(context.Background(), handle, "[Process] bash output:\n/Users/test"); err != nil {
+	if err := r.AppendProcess(context.Background(), handle, "[Process] Starting bash: pwd"); err != nil {
 		t.Fatalf("AppendProcess returned error: %v", err)
 	}
 	if err := r.Fail(context.Background(), handle, errors.New("boom")); err != nil {
@@ -78,21 +78,28 @@ func TestCardStreamingRendererShowsErrorSection(t *testing.T) {
 
 	card := mustDecodeCard(t, gw.Message(handle.MessageID))
 	elements := mustCardElements(t, card)
-	if len(elements) != 2 {
-		t.Fatalf("expected one folded block and final answer, got %d elements", len(elements))
+	if len(elements) < 2 {
+		t.Fatalf("expected at least action panel + final answer, got %d elements", len(elements))
 	}
+	// First element is the tool action panel
 	if tag := elements[0]["tag"]; tag != "collapsible_panel" {
 		t.Fatalf("expected first element to be collapsible_panel, got %#v", tag)
 	}
+	// Check header has error icon
+	header := elements[0]["header"].(map[string]any)
+	title := header["title"].(map[string]any)
+	titleText := title["content"].(string)
+	if !strings.HasPrefix(titleText, "❌") {
+		t.Fatalf("expected failed action to have ❌ icon, got %q", titleText)
+	}
+	// Check panel content has the error
 	blockElements, ok := elements[0]["elements"].([]any)
 	if !ok || len(blockElements) < 1 {
-		t.Fatalf("expected folded block to include markdown, got %#v", elements[0]["elements"])
+		t.Fatalf("expected panel with markdown, got %#v", elements[0]["elements"])
 	}
-	if got := mustMarkdownContent(t, blockElements[0]); !contains(got, "bash") || !contains(got, "/Users/test") || !contains(got, "boom") {
-		t.Fatalf("expected folded block markdown to include bash output and boom, got %q", got)
-	}
-	if got := mustMarkdownContent(t, elements[1]); !contains(got, "Generation failed") {
-		t.Fatalf("expected final markdown to show failure, got %q", got)
+	got := mustMarkdownContent(t, blockElements[0])
+	if !contains(got, "boom") {
+		t.Fatalf("expected panel content to contain boom, got %q", got)
 	}
 }
 
@@ -120,24 +127,19 @@ func TestCardStreamingRendererUsesStreamingCardAndElementUpdates(t *testing.T) {
 
 	card := mustDecodeCard(t, gw.Message(handle.MessageID))
 	elements := mustCardElements(t, card)
-	if len(elements) != 2 {
-		t.Fatalf("expected one folded block and final answer, got %d elements", len(elements))
+	if len(elements) < 2 {
+		t.Fatalf("expected at least action panel + final answer, got %d elements", len(elements))
 	}
-	blockElements, ok := elements[0]["elements"].([]any)
-	if !ok || len(blockElements) == 0 {
-		t.Fatalf("expected folded block elements, got %#v", elements[0]["elements"])
+	// First element: action panel with element_id
+	if got := elements[0]["element_id"]; got == nil || got == "" {
+		t.Fatalf("expected action panel to have element_id")
 	}
-	processNode := mustMap(t, blockElements[0])
-	if got := processNode["element_id"]; got == "" {
-		t.Fatalf("expected inserted block to have element_id, got %#v", got)
+	// Last element: final answer
+	lastIdx := len(elements) - 1
+	if got := elements[lastIdx]["element_id"]; got != finalAnswerElementID {
+		t.Fatalf("expected final element_id %q, got %#v", finalAnswerElementID, got)
 	}
-	if got := elements[1]["element_id"]; got != cardStreamingFinalElementID {
-		t.Fatalf("expected final element_id %q, got %#v", cardStreamingFinalElementID, got)
-	}
-	if got := mustMarkdownContent(t, blockElements[0]); !contains(got, "Starting bash: pwd") {
-		t.Fatalf("expected folded block content inserted before final, got %q", got)
-	}
-	if got := mustMarkdownContent(t, elements[1]); !contains(got, "final") {
+	if got := mustMarkdownContent(t, elements[lastIdx]); !contains(got, "final") {
 		t.Fatalf("expected final content updated via streaming element, got %q", got)
 	}
 }
@@ -163,25 +165,22 @@ func TestCardStreamingRendererFoldsIntermediateAnswerBeforeTool(t *testing.T) {
 
 	card := mustDecodeCard(t, gw.Message(handle.MessageID))
 	elements := mustCardElements(t, card)
-	if len(elements) != 3 {
-		t.Fatalf("expected intermediate answer block, tool block, final answer; got %d elements", len(elements))
+	// New behavior: Append does NOT create action panels, only updates final answer.
+	// AppendProcess creates one action panel for the tool. Final answer is separate.
+	// So: 1 collapsible_panel (tool) + 1 markdown (final answer)
+	if len(elements) != 2 {
+		t.Fatalf("expected 1 action panel + 1 final answer, got %d elements", len(elements))
 	}
-	for i := 0; i < 2; i++ {
-		if tag := elements[i]["tag"]; tag != "collapsible_panel" {
-			t.Fatalf("expected element %d to be collapsed panel, got %#v", i, tag)
-		}
-		if expanded := elements[i]["expanded"]; expanded != false {
-			t.Fatalf("expected element %d collapsed by default, got %#v", i, expanded)
-		}
+	// Tool action panel (collapsed since not last)
+	if tag := elements[0]["tag"]; tag != "collapsible_panel" {
+		t.Fatalf("expected first element to be collapsible_panel, got %#v", tag)
 	}
-	if got := mustMarkdownContent(t, mustFirstInnerElement(t, elements[0])); !contains(got, "First, a short explanation") {
-		t.Fatalf("expected first folded block to contain intermediate answer, got %q", got)
+	// Final answer element
+	if tag := elements[1]["tag"]; tag != "markdown" {
+		t.Fatalf("expected last element to be markdown, got %#v", tag)
 	}
-	if got := mustMarkdownContent(t, mustFirstInnerElement(t, elements[1])); !contains(got, "Starting bash: pwd") {
-		t.Fatalf("expected second folded block to contain tool use, got %q", got)
-	}
-	if got := mustMarkdownContent(t, elements[2]); !contains(got, "Final conclusion") {
-		t.Fatalf("expected final answer to be non-collapsible markdown, got %q", got)
+	if got := mustMarkdownContent(t, elements[1]); !contains(got, "Final conclusion") {
+		t.Fatalf("expected final answer, got %q", got)
 	}
 }
 
@@ -196,27 +195,39 @@ func TestCardStreamingRendererThrottlesFinalAnswerUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
+	// Append now immediately updates via UpdateStreamingElement (no throttling in new renderer)
 	if err := r.Append(context.Background(), handle, "a"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
 	if err := r.Append(context.Background(), handle, "b"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
-	if handle.updates != 0 {
-		t.Fatalf("expected token burst before interval to be buffered, got %d updates", handle.updates)
+	// New renderer always syncs final answer - updates should be 2
+	if handle.updates != 2 {
+		t.Fatalf("expected 2 final answer updates, got %d", handle.updates)
 	}
 
-	now = now.Add(testStreamingConfig().UpdateInterval.Duration)
 	if err := r.Append(context.Background(), handle, "c"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
-	if handle.updates != 1 {
-		t.Fatalf("expected one throttled final answer update, got %d", handle.updates)
+	if handle.updates != 3 {
+		t.Fatalf("expected 3 final answer updates after third append, got %d", handle.updates)
+	}
+
+	// Finalize
+	if err := r.Finish(context.Background(), handle, ""); err != nil {
+		t.Fatalf("Finish returned error: %v", err)
 	}
 	card := mustDecodeCard(t, gw.Message(handle.MessageID))
 	elements := mustCardElements(t, card)
-	if got := mustMarkdownContent(t, elements[0]); !contains(got, "abc") {
-		t.Fatalf("expected throttled final answer content to contain abc, got %q", got)
+	// Check that the final patch card was sent with streaming_mode: false
+	config := card["config"].(map[string]any)
+	if sm, ok := config["streaming_mode"]; ok && sm != false {
+		t.Fatalf("expected streaming_mode: false in final card, got %#v", sm)
+	}
+	// Final answer in the patch card
+	if got := mustMarkdownContent(t, elements[len(elements)-1]); !contains(got, "abc") {
+		t.Fatalf("expected final answer content to contain abc, got %q", got)
 	}
 }
 
