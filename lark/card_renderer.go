@@ -156,11 +156,20 @@ func (r *CardStreamingRenderer) Start(ctx context.Context, req StartRenderReques
 	}, nil
 }
 
+const batchFlushInterval = 5 * time.Second
+
 func (r *CardStreamingRenderer) Append(ctx context.Context, handle *RenderHandle, delta string) error {
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 	handle.state.FinalAnswer += delta
-	return r.syncFinalAnswerLocked(ctx, handle)
+	handle.pendingDelta += delta
+
+	// Flush if batch window elapsed or pending delta is large enough
+	if r.now().Sub(handle.lastFlush) >= batchFlushInterval ||
+		len(handle.pendingDelta) >= r.cfg.MaxUpdateChars {
+		return r.flushPendingDeltaLocked(ctx, handle)
+	}
+	return nil
 }
 
 func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *RenderHandle, delta string) error {
@@ -172,32 +181,56 @@ func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *Rende
 		return nil
 	}
 
-	// Determine action type from delta text
 	actType, actTitle := classifyProcessDelta(text)
 	actions := handle.state.Actions
 
-	// Check if this is a continuation of the last action
+	// Tool calls always create separate actions — never consolidate.
+	if actType == ActionTool {
+		act := Action{
+			ID:     fmt.Sprintf("panel_%d", len(actions)),
+			Seq:    len(actions),
+			Type:   actType,
+			Title:  actTitle,
+			State:  ActRunning,
+			Detail: formatProcessDetail(text),
+		}
+		handle.state.Actions = append(handle.state.Actions, act)
+
+		seq := handle.sequence
+		handle.sequence++
+		if err := r.withRetry(ctx, handle.ChatID, func() error {
+			return r.gw.InsertStreamingElementsBefore(ctx, handle.CardID, finalAnswerElementID, []map[string]any{buildPanelForInsert(act)}, seq)
+		}); err != nil {
+			return err
+		}
+		handle.lastSent[act.ID+"_content"] = act.Detail
+		handle.updates++
+		handle.lastFlush = r.now()
+		if len(handle.state.Actions) > maxActions {
+			handle.state.Actions = compactActions(handle.state.Actions)
+		}
+		return nil
+	}
+
+	// Non-tool actions: check if continuation of the last action
 	if len(actions) > 0 && actions[len(actions)-1].Type == actType &&
-		(actType == ActionTool || actType == ActionProcess) &&
 		isProcessContinuation(text) {
-		// Update last action detail
 		last := &actions[len(actions)-1]
 		last.Detail = strings.TrimSpace(last.Detail + "\n" + formatProcessDetail(text))
 		return r.syncActionContentLocked(ctx, handle, last)
 	}
 
-	// New action
+	// New non-tool action
 	act := Action{
-		ID:    fmt.Sprintf("panel_%d", len(actions)),
-		Seq:   len(actions),
-		Type:  actType,
-		Title: actTitle,
-		State: ActRunning,
+		ID:     fmt.Sprintf("panel_%d", len(actions)),
+		Seq:    len(actions),
+		Type:   actType,
+		Title:  actTitle,
+		State:  ActRunning,
 		Detail: formatProcessDetail(text),
 	}
 	handle.state.Actions = append(handle.state.Actions, act)
 
-	// Insert panel before answer_final
 	seq := handle.sequence
 	handle.sequence++
 	if err := r.withRetry(ctx, handle.ChatID, func() error {
@@ -208,8 +241,6 @@ func (r *CardStreamingRenderer) AppendProcess(ctx context.Context, handle *Rende
 	handle.lastSent[act.ID+"_content"] = act.Detail
 	handle.updates++
 	handle.lastFlush = r.now()
-
-	// Compact if too many actions
 	if len(handle.state.Actions) > maxActions {
 		handle.state.Actions = compactActions(handle.state.Actions)
 	}
@@ -223,9 +254,11 @@ func (r *CardStreamingRenderer) Finish(ctx context.Context, handle *RenderHandle
 	if final != "" {
 		handle.state.FinalAnswer = final
 	}
-	// Ensure final answer is synced
-	if err := r.syncFinalAnswerLocked(ctx, handle); err != nil {
-		return err
+	// Flush any pending deltas first
+	if handle.pendingDelta != "" {
+		if err := r.flushPendingDeltaLocked(ctx, handle); err != nil {
+			return err
+		}
 	}
 
 	handle.state.Finished = true
@@ -245,6 +278,11 @@ func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, 
 	}
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
+
+	// Flush any pending deltas first
+	if handle.pendingDelta != "" {
+		_ = r.flushPendingDeltaLocked(ctx, handle)
+	}
 
 	// Add error action if there's a last running action
 	actions := handle.state.Actions
@@ -274,13 +312,10 @@ func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, 
 
 // ─── Sync helpers ──────────────────────────────────────────────
 
-func (r *CardStreamingRenderer) syncFinalAnswerLocked(ctx context.Context, handle *RenderHandle) error {
-	content := handle.state.FinalAnswer
-	if content == "" {
-		content = "_Waiting..._"
-	}
-	content = truncateRunes(content, r.cfg.MaxUpdateChars, "")
+func (r *CardStreamingRenderer) flushPendingDeltaLocked(ctx context.Context, handle *RenderHandle) error {
+	content := truncateRunes(handle.state.FinalAnswer, r.cfg.MaxUpdateChars, "")
 	if content == handle.lastSent[finalAnswerElementID] {
+		handle.pendingDelta = ""
 		return nil
 	}
 	seq := handle.sequence
@@ -293,6 +328,7 @@ func (r *CardStreamingRenderer) syncFinalAnswerLocked(ctx context.Context, handl
 	handle.lastSent[finalAnswerElementID] = content
 	handle.updates++
 	handle.lastFlush = r.now()
+	handle.pendingDelta = ""
 	return nil
 }
 

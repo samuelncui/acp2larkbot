@@ -195,23 +195,24 @@ func TestCardStreamingRendererThrottlesFinalAnswerUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned error: %v", err)
 	}
-	// Append now immediately updates via UpdateStreamingElement (no throttling in new renderer)
+	// Append "a", "b" within the same tick — both buffered (no flush)
 	if err := r.Append(context.Background(), handle, "a"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
 	if err := r.Append(context.Background(), handle, "b"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
-	// New renderer always syncs final answer - updates should be 2
-	if handle.updates != 2 {
-		t.Fatalf("expected 2 final answer updates, got %d", handle.updates)
+	if handle.updates != 0 {
+		t.Fatalf("expected first burst to be buffered, got %d updates", handle.updates)
 	}
 
+	// Advance time past the batch flush interval
+	now = now.Add(batchFlushInterval)
 	if err := r.Append(context.Background(), handle, "c"); err != nil {
 		t.Fatalf("Append returned error: %v", err)
 	}
-	if handle.updates != 3 {
-		t.Fatalf("expected 3 final answer updates after third append, got %d", handle.updates)
+	if handle.updates != 1 {
+		t.Fatalf("expected one batched final answer update, got %d", handle.updates)
 	}
 
 	// Finalize

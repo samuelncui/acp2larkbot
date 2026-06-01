@@ -54,6 +54,21 @@ func buildInitialCard() map[string]any {
 			"streaming_mode": true,
 			"update_multi":   true,
 			"width_mode":     "fill",
+			"streaming_config": map[string]any{
+				"print_strategy": "fast",
+				"print_frequency_ms": map[string]any{
+					"default": 70,
+					"android": 70,
+					"ios":     70,
+					"pc":      70,
+				},
+				"print_step": map[string]any{
+					"default": 1,
+					"android": 1,
+					"ios":     1,
+					"pc":      1,
+				},
+			},
 		},
 		"body": map[string]any{
 			"elements": []map[string]any{
@@ -100,9 +115,9 @@ func buildPanel(a Action, final bool, isLast bool) map[string]any {
 		icon = actionFinalIcon(a.Type, a.State)
 	}
 
-	expanded := true
-	if final && !isLast {
-		expanded = false
+	expanded := false
+	if final && isLast {
+		expanded = true
 	}
 
 	header := fmt.Sprintf("%s %s", icon, titleForAction(a))
@@ -112,14 +127,28 @@ func buildPanel(a Action, final bool, isLast bool) map[string]any {
 	}
 
 	return map[string]any{
-		"tag":        "collapsible_panel",
-		"element_id": a.ID,
-		"expanded":   expanded,
+		"tag":              "collapsible_panel",
+		"element_id":       a.ID,
+		"expanded":         expanded,
+		"vertical_spacing": "8px",
+		"padding":          "8px 8px 8px 8px",
+		"border": map[string]any{
+			"color":         "grey",
+			"corner_radius": "5px",
+		},
 		"header": map[string]any{
 			"title": map[string]any{
 				"tag":     "plain_text",
 				"content": header,
 			},
+			"vertical_align": "center",
+			"icon": map[string]any{
+				"tag":   "standard_icon",
+				"token": "down-small-ccm_outlined",
+				"size":  "16px 16px",
+			},
+			"icon_position":       "right",
+			"icon_expanded_angle": -180,
 		},
 		"elements": []map[string]any{
 			markdownElement(a.ID+"_content", content),
@@ -128,9 +157,9 @@ func buildPanel(a Action, final bool, isLast bool) map[string]any {
 }
 
 // buildPanelForInsert renders a panel for InsertStreamingElementsBefore.
-// During streaming: 🐾 icon, expanded=true.
+// During streaming: 🐾 icon, expanded=false.
 func buildPanelForInsert(a Action) map[string]any {
-	return buildPanel(a, false, true)
+	return buildPanel(a, false, false) // final=false, isLast=false → expanded=false
 }
 
 // ─── Icons ─────────────────────────────────────────────────────

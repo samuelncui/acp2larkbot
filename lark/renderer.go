@@ -44,8 +44,9 @@ type RenderHandle struct {
 	mu        sync.Mutex
 
 	// CardStreamingRenderer uses these fields instead of the generic ones above.
-	state    *CardState
-	lastSent map[string]string // elementID → content
+	state        *CardState
+	lastSent     map[string]string // elementID → content
+	pendingDelta string            // accumulated deltas not yet flushed to Lark
 }
 
 type cardBlock struct {
