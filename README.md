@@ -1,97 +1,125 @@
 # acp2larkbot
 
-`acp2larkbot` is a Go service that connects a Lark bot to an ACP backend.
+A Go service that bridges a **Lark (飞书) bot** to an **ACP agent backend**.
 
-It receives text messages from Lark over websocket, checks chat and user access rules, forwards the message to an ACP agent, and streams the agent response back to Lark.
+You send a message in a Lark chat → the bot forwards it to an ACP agent → the agent's response streams back to Lark in real time.
 
-## What the current implementation supports
-
-- Lark websocket event intake
-- text message handling
-- chat allowlisting through `chats[]`
-- user and command authorization
-- built-in commands:
-  - `/cancel`
-  - `/status`
-  - `/reset RESET`
-- per-chat serial worker queues
-- session strategies:
-  - `static`
-  - `auto_create`
-  - `ephemeral`
-- local state with bbolt
-- ACP backends:
-  - local `cmd`
-  - remote `network.websocket`
-- response streaming back to Lark as:
-  - updated text messages, or
-  - CardKit streaming cards
-
-## What this README covers
-
-This README is focused on **how to use the project today**.
-
-Detailed design notes are split by module under `.agent/documents/`:
-
-- `.agent/documents/app.md`
-- `.agent/documents/config.md`
-- `.agent/documents/lark.md`
-- `.agent/documents/router.md`
-- `.agent/documents/session-worker-state.md`
-- `.agent/documents/acp.md`
-
-## Requirements
-
-- Go 1.22+
-- a Lark app with websocket event access
-- a valid Lark `app_id` and `app_secret`
-- an ACP backend, either:
-  - a local executable speaking ACP over stdio, or
-  - a remote ACP websocket endpoint speaking `acp.websocket`
-
-## Build
+## Quick Install
 
 ```bash
-go build ./cmd/acp2larkbot
+curl -fsSL https://raw.githubusercontent.com/samuelncui/acp2larkbot/main/install.sh | bash
 ```
 
-## Configuration workflow
+Or pick a binary manually from [Releases](https://github.com/samuelncui/acp2larkbot/releases).
 
-1. Create a YAML config file.
-2. Fill in Lark credentials.
-3. Define at least one ACP agent.
-4. Define at least one allowed chat in `chats[]`.
-5. Validate the config.
-6. Start the service.
+## Prerequisites
 
-## Minimal local `cmd` example
+- Go 1.22+ (if building from source)
+- A Lark app with websocket event access
+- Lark `app_id` and `app_secret`
+- An ACP backend (local executable or remote websocket endpoint)
 
-This example uses a local ACP server executable.
+## Install
 
-Replace placeholder values such as chat IDs, user IDs, paths, and command names with real values from your environment.
+### One-liner (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/samuelncui/acp2larkbot/main/install.sh | bash
+```
+
+Installs to `/usr/local/bin/acp2larkbot` (requires sudo). Set `BINDIR=~/.local/bin` to install elsewhere.
+
+### From source
+
+```bash
+go install github.com/samuelncui/acp2larkbot/cmd/acp2larkbot@latest
+```
+
+### Manual download
+
+Go to [Releases](https://github.com/samuelncui/acp2larkbot/releases), download the tar.gz for your platform, extract and put the binary in your PATH.
+
+## Quick Start
+
+1. Create a config file `config.yaml`:
 
 ```yaml
-log:
-  level: info
-
 lark:
   app_id: ${ACP2LARKBOT_LARK_APP_ID}
   app_secret: ${ACP2LARKBOT_LARK_APP_SECRET}
-  connection_mode: websocket
-  ignore_self_messages: true
-  ignore:
-    sender_types: [bot]
-    self_app_id: ${ACP2LARKBOT_LARK_APP_ID}
-    message_id_ttl: 24h
-    max_message_ids: 10000
+
+unknown_chat:
+  behavior: reply_error
+  message: 当前会话未启用 acp2larkbot。
+
+dedupe:
+  enabled: true
+  ttl: 24h
+
+state:
+  type: bolt
+  path: ./state/acp2larkbot.db
+
+acp:
+  default_agent: local
+  agents:
+    local:
+      type: cmd
+      command: /path/to/your-acp-server
+      cwd: /path/to/workspace
+
+chats:
+  - id: oc_xxxxxxxxxxxx
+    agent: local
+```
+
+2. Validate:
+
+```bash
+acp2larkbot -config ./config.yaml -validate-only
+# → config ok
+```
+
+3. Run:
+
+```bash
+ACP2LARKBOT_LARK_APP_ID=cli_xxx \
+ACP2LARKBOT_LARK_APP_SECRET=xxx \
+acp2larkbot -config ./config.yaml
+```
+
+## Configuration
+
+The config file is YAML. Sensitive fields support `${ENV_VAR}` interpolation.
+
+### Required top-level sections
+
+| Section | Purpose |
+|----------|---------|
+| `lark` | Lark app credentials and event handling |
+| `unknown_chat` | Behavior when an unlisted chat sends a message |
+| `dedupe` | Duplicate message detection |
+| `state` | Local state storage (bbolt) |
+| `acp` | ACP backend agent definitions |
+| `chats` | Allowed chats and their agent assignments |
+
+### Lark
+
+```yaml
+lark:
+  app_id: ${ACP2LARKBOT_LARK_APP_ID}   # required
+  app_secret: ${ACP2LARKBOT_LARK_APP_SECRET}  # required
+  domain: feishu                        # default: feishu
+  connection_mode: websocket            # only websocket supported
+  ignore_self_messages: true            # must be true
   trigger:
-    message_types: [text]
-    ignore_update_events: true
-    ignore_card_events: true
+    message_types: [text]               # only text supported
+    ignore_update_events: true          # must be true
+    ignore_card_events: true            # must be true
     require_mention_in_group: false
   streaming:
     enabled: true
-    mode: text
+    mode: text                          # text | card_streaming
     update_interval: 1s
     min_update_chars: 16
     max_update_chars: 8000
@@ -100,10 +128,74 @@ lark:
     fallback: append_messages
     fallback_max_messages: 3
     truncate_notice: "\n\n[truncated]"
-    rate_limit:
-      per_chat: 30/min
-      global: 300/min
+```
 
+### ACP Agents
+
+Two types are supported:
+
+**`cmd`** — local executable speaking ACP over stdio:
+
+```yaml
+acp:
+  default_agent: my-agent
+  agents:
+    my-agent:
+      type: cmd
+      command: /absolute/path/to/acp-server
+      args: []
+      cwd: /absolute/path/to/workspace
+      timeouts:
+        start: 30s
+        request: 10m
+        idle: 30m
+```
+
+**`network`** — remote ACP websocket endpoint:
+
+```yaml
+acp:
+  agents:
+    remote:
+      type: network
+      protocol:
+        transport: websocket
+        binding: acp.websocket
+        max_inflight: 1
+      url: wss://your-acp.example.com/acp
+      endpoint_allowlist:
+        - wss://your-acp.example.com/acp
+      auth:
+        type: bearer
+        token: ${ACP_TOKEN}
+      tls:
+        insecure_skip_verify: false
+        server_name: your-acp.example.com
+      timeouts:
+        connect: 10s
+        request: 10m
+```
+
+### Chats
+
+```yaml
+chats:
+  - id: oc_xxxxxxxxxxxx     # chat ID from Lark
+    agent: my-agent          # references acp.agents key
+    queue:
+      max_pending: 5
+      on_full: reject        # reject | drop_oldest
+    session:
+      strategy: auto_create  # static | auto_create | ephemeral
+      scope: sender          # chat | sender
+      prefix: lark-auto
+      ttl: 168h
+      idle_timeout: 24h
+```
+
+### Authorization (optional)
+
+```yaml
 authz:
   admins:
     - ou_adminxxxxxxxx
@@ -119,21 +211,11 @@ authz:
         users:
           - ou_adminxxxxxxxx
           - ou_userxxxxxxxx
+```
 
-unknown_chat:
-  behavior: reply_error
-  message: This chat is not enabled for acp2larkbot.
-  include_chat_id: false
-  rate_limit_interval: 10m
+### Commands (optional)
 
-dedupe:
-  enabled: true
-  ttl: 24h
-
-state:
-  type: bolt
-  path: ./state/acp2larkbot.db
-
+```yaml
 commands:
   enabled: true
   prefix: /
@@ -148,183 +230,76 @@ commands:
       roles: [admin]
       require_confirm: true
       confirm_text: RESET
-
-acp:
-  default_agent: local
-  agents:
-    local:
-      type: cmd
-      command: /absolute/path/to/your-acp-server
-      args: []
-      cwd: /absolute/path/to/workspace
-      timeouts:
-        start: 30s
-        request: 10m
-        idle: 30m
-
-chats:
-  - id: oc_chatxxxxxxxx
-    type: group
-    name: main-group
-    agent: local
-    cwd: /absolute/path/to/workspace
-    queue:
-      max_pending: 5
-      on_full: reject
-    session:
-      strategy: auto_create
-      scope: sender
-      prefix: lark-auto
-      allow_shared_session: false
-      ttl: 168h
-      idle_timeout: 24h
 ```
 
-`acp2larkbot` only launches the local ACP server process and forwards ACP
-messages. Tool execution, filesystem/network access control, and sandbox policy
-belong to the ACP server / agent implementation.
+## Built-in Commands
 
-Local `cmd` agents inherit the `acp2larkbot` process environment by default.
-Do not run untrusted ACP server executables with bot credentials in the
-environment.
+When `commands.enabled: true`, users in allowed chats can use:
 
-## Remote ACP websocket example
+| Command | Who | What |
+|---------|-----|------|
+| `/cancel` | requester or admin | Cancel the running request |
+| `/status` | any allowed user | Show chat queue status |
+| `/reset RESET` | admin only | Safety check (does not delete sessions) |
 
-Use this shape when your ACP backend is remote instead of local:
+## Session Strategies
 
-```yaml
-acp:
-  default_agent: remote
-  agents:
-    remote:
-      type: network
-      protocol:
-        transport: websocket
-        binding: acp.websocket
-        max_inflight: 1
-      url: wss://example.com/acp
-      endpoint_allowlist:
-        - wss://example.com/acp
-      auth:
-        type: bearer
-        token: ${ACP_TOKEN}
-      tls:
-        insecure_skip_verify: false
-        server_name: example.com
-        ca_file: /absolute/path/to/ca.pem
-      heartbeat:
-        type: websocket_ping_pong
-        interval: 30s
-        timeout: 10s
-      request:
-        require_request_id: true
-        idempotency_ttl: 24h
-      timeouts:
-        connect: 10s
-        request: 10m
-```
+| Strategy | Behavior |
+|----------|----------|
+| `static` | Use a fixed session ID from config |
+| `auto_create` | Create session on first use, reuse until expiry (persisted in bbolt) |
+| `ephemeral` | New session per request, closed after completion |
 
-Note: the config schema contains additional fields such as retry, reconnect, token refresh, and session recovery, but they are not fully active runtime features in the current implementation.
+## Streaming Modes
 
-## Validate configuration
+| Mode | Behavior |
+|------|----------|
+| `text` | Update the Lark message text in place |
+| `card_streaming` | Use CardKit streaming cards for richer output |
 
-Before starting the bot, validate the file:
+## State
+
+The bot stores three kinds of data in a local bbolt file:
+
+- Session records (for `auto_create`)
+- Dedupe keys
+- Rate-limit timestamps for unknown-chat replies
+
+`/reset` does not delete persisted sessions in the current implementation.
+
+## Operational Notes
+
+- Single instance per Lark app. Running multiple instances against the same bot will break deduplication and ordering.
+- The state file is local. Back it up if sessions are important.
+- No distributed coordination. No multi-instance support.
+
+## Build from Source
 
 ```bash
-go run ./cmd/acp2larkbot -config ./config.yaml -validate-only
+git clone https://github.com/samuelncui/acp2larkbot.git
+cd acp2larkbot
+go build ./cmd/acp2larkbot
 ```
 
-Expected output:
-
-```text
-config ok
-```
-
-## Run
-
-```bash
-go run ./cmd/acp2larkbot -config ./config.yaml
-```
-
-Or run the compiled binary:
-
-```bash
-./acp2larkbot -config ./config.yaml
-```
-
-## How message handling works
-
-At a high level:
-
-1. Lark sends a websocket event.
-2. The bot ignores self-generated or duplicate events.
-3. The chat must exist in `chats[]`.
-4. The sender must pass `authz` rules.
-5. If the message is a built-in command, the bot handles it locally.
-6. Otherwise the message is queued for the chat worker.
-7. The worker resolves a session and sends the text to the ACP backend.
-8. The response is streamed back to Lark.
-
-## Built-in commands
-
-### `/cancel`
-
-Cancels the currently running request for the chat.
-
-- the request owner can cancel it
-- an admin can also cancel it
-
-### `/status`
-
-Shows whether the current chat is idle or running.
-
-### `/reset RESET`
-
-Admin-only command.
-
-Important: in the current implementation, this command does **not** delete persisted auto-created session records. It only refuses reset while a request is still running and otherwise returns success.
-
-## Session strategies
-
-### `static`
-
-Use a fixed ACP session ID from config.
-
-### `auto_create`
-
-Create a session on first use and persist the mapping in the local bbolt state file.
-
-### `ephemeral`
-
-Create a new session for each request and close it after the request finishes.
-
-## Notes on rendering modes
-
-The current codebase supports two renderer implementations:
-
-- `mode: text` or `mode: card` -> standard text-update renderer
-- `mode: card_streaming` -> CardKit streaming renderer
-
-If you want real CardKit streaming behavior, use:
-
-```yaml
-lark:
-  streaming:
-    enabled: true
-    mode: card_streaming
-```
-
-## Operational notes
-
-- This project currently assumes a single running instance.
-- The state file is local to the process.
-- Worker queues are per process.
-- Dedupe and self-message protection are local, not distributed.
-
-## Run tests
+## Run Tests
 
 ```bash
 go test ./...
 ```
 
-Some live Lark tests are present in the repository but skip automatically unless the required Lark credentials are provided in the environment.
+Some live Lark tests skip automatically unless Lark credentials are provided in the environment.
+
+## Architecture Docs
+
+Detailed design notes per module:
+
+- [.agent/documents/app.md](.agent/documents/app.md) — Application lifecycle and event flow
+- [.agent/documents/config.md](.agent/documents/config.md) — Config loading, defaults, validation rules
+- [.agent/documents/lark.md](.agent/documents/lark.md) — Lark websocket integration
+- [.agent/documents/router.md](.agent/documents/router.md) — Message routing and commands
+- [.agent/documents/session-worker-state.md](.agent/documents/session-worker-state.md) — Session and worker design
+- [.agent/documents/acp.md](.agent/documents/acp.md) — ACP client protocol
+
+## License
+
+BSD 2-Clause
