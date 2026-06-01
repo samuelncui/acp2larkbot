@@ -312,7 +312,7 @@ func (c *WSClient) handleNotification(env acpEnvelope) {
 			return
 		}
 		if chunk.Content.Type == "text" && chunk.Content.Text != "" {
-			logrus.WithFields(logrus.Fields{"session_id": note.SessionID, "len": len(chunk.Content.Text)}).Debug("acp message chunk")
+			logrus.WithFields(logrus.Fields{"session_id": note.SessionID, "len": len(chunk.Content.Text), "text": chunk.Content.Text}).Debug("acp message chunk")
 			stream <- Event{Type: EventDelta, Delta: chunk.Content.Text}
 		}
 	case "tool_call", "tool_call_update":

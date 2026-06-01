@@ -176,12 +176,12 @@ func (r *CardStreamingRenderer) Finish(ctx context.Context, handle *RenderHandle
 	if err := r.flushFinalLocked(ctx, handle, true); err != nil {
 		return err
 	}
-	finalizeErr := r.finalizeLocked(ctx, handle)
 	patchErr := r.patchFinalCardLocked(ctx, handle, true)
-	if finalizeErr != nil {
-		return finalizeErr
+	finalizeErr := r.finalizeLocked(ctx, handle)
+	if patchErr != nil {
+		return patchErr
 	}
-	return patchErr
+	return finalizeErr
 }
 
 func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, err error) error {
@@ -389,11 +389,15 @@ func buildStreamingSnapshotCard(handle *RenderHandle, final bool) map[string]any
 		}
 	}
 	elements = append(elements, markdownElement(cardStreamingFinalElementID, renderFinalAnswer(handle, final)))
+	config := map[string]any{
+		"width_mode": "fill",
+	}
+	if final {
+		config["streaming_mode"] = false
+	}
 	return map[string]any{
 		"schema": "2.0",
-		"config": map[string]any{
-			"width_mode": "fill",
-		},
+		"config": config,
 		"body": map[string]any{
 			"elements": elements,
 		},
