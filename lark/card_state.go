@@ -115,10 +115,7 @@ func buildPanel(a Action, final bool, isLast bool) map[string]any {
 		icon = actionFinalIcon(a.Type, a.State)
 	}
 
-	expanded := false
-	if final && isLast {
-		expanded = true
-	}
+	expanded := false // never auto-expand; headers show summary for debug
 
 	header := fmt.Sprintf("%s %s", icon, titleForAction(a))
 	content := a.Detail
