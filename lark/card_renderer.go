@@ -288,7 +288,7 @@ func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, 
 	actions := handle.state.Actions
 	if len(actions) > 0 && actions[len(actions)-1].State == ActRunning {
 		actions[len(actions)-1].State = ActFailed
-		actions[len(actions)-1].Detail = strings.TrimSpace(actions[len(actions)-1].Detail + "\n\n❌ " + err.Error())
+		actions[len(actions)-1].Detail = strings.TrimSpace(actions[len(actions)-1].Detail + "\n\n" + codeFence(err.Error()))
 	} else {
 		// Standalone error action
 		act := Action{
@@ -297,7 +297,7 @@ func (r *CardStreamingRenderer) Fail(ctx context.Context, handle *RenderHandle, 
 			Type:   ActionProcess,
 			Title:  "Error",
 			State:  ActFailed,
-			Detail: err.Error(),
+			Detail: codeFence(err.Error()),
 		}
 		handle.state.Actions = append(handle.state.Actions, act)
 	}
