@@ -31,7 +31,7 @@ The loader currently applies these defaults when fields are omitted:
 - `lark.connection_mode: websocket`
 - `lark.ignore.self_app_id: <lark.app_id>`
 - `unknown_chat.behavior: reply_error`
-- `unknown_chat.message: 当前会话未启用 acp2larkbot。`
+- `unknown_chat.message: This chat is not enabled for acp2larkbot.`
 - `state.type: bolt`
 - `commands.prefix: /`
 - `chats[].queue.max_pending: 5`

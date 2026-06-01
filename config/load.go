@@ -63,7 +63,7 @@ func setDefaults(cfg *Config) {
 		}
 	}
 	if cfg.Lark.Domain == "" {
-		cfg.Lark.Domain = "feishu"
+		cfg.Lark.Domain = "lark"
 	}
 	if cfg.Lark.ConnectionMode == "" {
 		cfg.Lark.ConnectionMode = "websocket"

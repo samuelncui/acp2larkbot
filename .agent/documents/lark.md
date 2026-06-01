@@ -71,7 +71,7 @@ The application can instantiate one of two renderers:
 
 Behavior:
 
-1. Send an initial text message with `思考中...`
+1. Send an initial text message with `Thinking...`
 2. Accumulate ACP deltas in a local buffer
 3. Periodically update the same Lark message
 4. On finish, write the final text

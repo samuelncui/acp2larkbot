@@ -1,6 +1,6 @@
 # acp2larkbot
 
-A Go service that bridges a **Lark (飞书) bot** to an **ACP agent backend**.
+A Go service that bridges a **Lark bot** to an **ACP agent backend**.
 
 You send a message in a Lark chat → the bot forwards it to an ACP agent → the agent's response streams back to Lark in real time.
 
@@ -50,7 +50,7 @@ lark:
 
 unknown_chat:
   behavior: reply_error
-  message: 当前会话未启用 acp2larkbot。
+  message: This chat is not enabled for acp2larkbot.
 
 dedupe:
   enabled: true
@@ -109,7 +109,7 @@ The config file is YAML. Sensitive fields support `${ENV_VAR}` interpolation.
 lark:
   app_id: ${ACP2LARKBOT_LARK_APP_ID}   # required
   app_secret: ${ACP2LARKBOT_LARK_APP_SECRET}  # required
-  domain: feishu                        # default: feishu
+  domain: lark                          # default: lark
   connection_mode: websocket            # only websocket supported
   ignore_self_messages: true            # must be true
   trigger:
